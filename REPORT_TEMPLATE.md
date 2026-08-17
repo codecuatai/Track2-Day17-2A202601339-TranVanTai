@@ -55,7 +55,7 @@ TỔNG KẾT
 </details>
 
 Tổng kết: **4 / 4 tiêu chí chính đạt** · **Bài mở rộng A đạt** ·
-**Bài mở rộng B đạt** · Tự chấm theo rubric: **110 / 100**
+**Bài mở rộng B đạt** ·
 
 ---
 
