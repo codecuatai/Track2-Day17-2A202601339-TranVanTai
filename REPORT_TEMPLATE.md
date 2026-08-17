@@ -13,9 +13,9 @@
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 LAB 17 · make verify
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-run 1/3 … 37.5s
-run 2/3 … 32.6s
-run 3/3 … 31.8s
+run 1/3 … 31.9s
+run 2/3 … 38.8s
+run 3/3 … 33.1s
 
 BẢNG                  ỔN ĐỊNH          SỐ HÀNG     KỲ VỌNG   GHI CHÚ
 ──────────────────────────────────────────────────────────────────────────
@@ -37,8 +37,8 @@ dbt test                                    ✓ 11/11 pass
 silver_tickets.priority ∈ 1..4, không NULL  ✓ sạch
 quarantine_tickets đúng số bản ghi lỗi      ✓ 312 / 312
 gold_training_set: 1 hàng / 1 ticket        ✓ không lặp
-dashboard rows scanned                      ✗ 5,000,000 → 5,000,000
-  số file parquet                           ✗ 5,000 → 5,000
+dashboard rows scanned                      ✓ 5,000,000 → 9,324 (536.3×)
+  số file parquet                           ✓ 5,000 → 14
   kết quả truy vấn không đổi                ✓
 DAG: catchup / max_active_runs              ✓ False / 1
 
@@ -54,7 +54,8 @@ TỔNG KẾT
 
 </details>
 
-Tổng kết: **4 / 4 tiêu chí đạt**
+Tổng kết: **4 / 4 tiêu chí chính đạt** · **Bài mở rộng A đạt** ·
+**Bài mở rộng B đạt** · Tự chấm theo rubric: **110 / 100**
 
 ---
 
@@ -113,21 +114,38 @@ pipeline dừng khi gặp bản ghi lỗi?
 
 ---
 
-## 4 · *(mở rộng, không bắt buộc)* Bài trong EXTRA.md
+## 4 · Bài mở rộng A — Tối ưu dashboard Parquet
 
 | | |
 |---|---|
-| **Bài đã làm** | Không làm; ba nhiệm vụ chính đã đạt 100 điểm. |
-| **Nguyên nhân** | Dashboard chậm do 5.000 file nhỏ và layout không hỗ trợ partition pruning; đây là bài thưởng, không thuộc 4 tiêu chí chính. |
-| **Cách khắc phục** | Chưa triển khai compact/partition. |
-| **Bằng chứng** | Core verify đạt 4/4; dashboard giữ nguyên hash nhưng rows scanned vẫn 5.000.000. |
+| **Triệu chứng** | Dataset chỉ có 130.683 hàng nhưng bị chia thành 5.000 file nhỏ; truy vấn một customer trong một ngày vẫn báo 5.000.000 rows scanned và mất khoảng 2.422,4 ms trên máy đo. |
+| **Nguyên nhân** | File không partition nên engine phải mở toàn bộ 5.000 file trước khi biết file nào hữu ích. Predicate `strftime(event_time, ...)` bọc cột trong hàm nên không sargable và không thể dùng thông tin partition/min-max để pruning. Chi phí đọc còn bị làm tròn theo từng file, tạo small-file amplification. |
+| **Cách khắc phục** | `tools/compact.py` ghi lại dataset partition theo `event_date` (14 giá trị thay vì 650 customer), sắp theo `event_date, customer_name, event_time, event_id`, dùng row group 2.048. Query mới đọc recursive với `hive_partitioning=true` và lọc trực tiếp `event_date = DATE '2026-08-09'`. |
+| **Bằng chứng** | Rows scanned: **5.000.000 → 9.324**, giảm **536,3×** (yêu cầu ≥10×) · files: **5.000 → 14** · rows on disk: **130.683 → 130.683** · result hash: `4379e4c5d9f3` không đổi · thời gian tham khảo: **2.422,4 → 25,6 ms**. |
+
+Partition theo ngày tạo 14 thư mục có kích thước hợp lý và cho phép loại 13
+ngày trước khi mở file. Không partition theo customer vì 650 giá trị sẽ tái tạo
+small-file problem. Sắp theo customer giữ các hàng của ACME liền nhau để min/max
+của row group có ích cho các dashboard filter khác; row group 2.048 tránh gói
+cả ngày vào một row group có min/max quá rộng.
+
+## 5 · Bài mở rộng B — Consumer bị kill giữa batch
+
+| | |
+|---|---|
+| **Triệu chứng** | Implementation ban đầu commit offset trước khi ghi. Nếu chết ở batch 7 (500 message/batch), offset đã tiến tới 3.500 trong khi database mới có 3.000 hàng; restart bỏ qua batch 7 và kết quả chỉ còn 19.500/20.000 hàng. |
+| **Nguyên nhân** | Commit-before-write là at-most-once: transport coi batch đã xử lý dù side effect chưa tồn tại. Chỉ đảo thành write-before-commit tạo at-least-once nhưng batch có thể replay; với INSERT thuần, replay sẽ gây trùng. Exactly-once không được cung cấp xuyên qua ranh giới offset file và DuckDB transaction. |
+| **Cách khắc phục** | Ghi và commit transaction DuckDB trước, đặt điểm crash sau write và chỉ commit offset cuối cùng. Thêm primary key `event_id`; mỗi batch dùng vectorized `from_json` và `ON CONFLICT (event_id) DO UPDATE` để replay idempotent. `DO UPDATE` được chọn thay vì `DO NOTHING` để payload mới/corrected có thể thay thế dữ liệu cũ khi replay. |
+| **Bằng chứng** | Không sự cố: 20.000/20.000 · crash batch 7: exit 137, committed offset **3.000** · restart xử lý 17.000 message (bao gồm replay batch 7) · cuối cùng **20.000 hàng / 20.000 event_id**, không mất, không trùng, `C == A`, crash-test **ĐẠT**. |
 
 ---
 
-## 5 · Tổng kết
+## 6 · Tổng kết
 
 | Nhiệm vụ | Khi tiếp nhận một hệ thống chưa quen, tôi sẽ kiểm tra điều này trước tiên |
 |---|---|
 | 1 | Grain, natural key và câu lệnh ghi thật sự mà incremental model sinh ra khi retry. |
 | 2 | Quan hệ giữa event-time và ingestion-time, phân bố độ trễ và watermark hiện tại. |
 | 3 | Phân bố giá trị raw, contract đang thực sự được bật hay chưa và đường đi của bản ghi bị loại. |
+| A | Cardinality của partition key, số/kích thước file, row-group layout và khả năng sargable của predicate. |
+| B | Thứ tự giữa side effect và commit offset, cùng tính idempotent của nơi nhận khi message bị replay. |

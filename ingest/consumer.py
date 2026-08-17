@@ -17,7 +17,7 @@ KHUNG THỰC HIỆN — NHIỆM VỤ 5
       at-least-once  : commit offset SAU khi ghi    -> crash = trùng dữ liệu
       exactly-once   : không tồn tại ở tầng giao vận
 
-  Hai hạng mục cần xử lý, thiếu một là chưa đủ:
+  Hai hạng mục được xử lý trong implementation bên dưới, thiếu một là chưa đủ:
 
     (a) Thứ tự thao tác trong consume() — xem khối được đánh dấu bên dưới.
         Đổi thứ tự chuyển ngữ nghĩa từ nhóm này sang nhóm kia. Câu hỏi: nếu
@@ -40,6 +40,7 @@ KHUNG THỰC HIỆN — NHIỆM VỤ 5
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -53,7 +54,7 @@ TABLE = "bronze_events_stream"
 
 DDL = f"""
 create table if not exists {TABLE} (
-    event_id      varchar,
+    event_id      varchar primary key,
     ticket_id     varchar,
     customer_id   varchar,
     customer_name varchar,
@@ -66,21 +67,43 @@ create table if not exists {TABLE} (
 
 
 def write_batch(con: duckdb.DuckDBPyConnection, batch: list[dict]) -> None:
-    """Ghi một lô message xuống kho — nhiệm vụ 5, hạng mục (b).
-
-    Câu lệnh hiện tại là INSERT thuần: ghi lại cùng một event_id sẽ tạo thêm
-    một hàng mới. Xem khung mã giả ở đầu file.
-    """
-    con.executemany(
-        f"insert into {TABLE} values (?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-            (
-                r["event_id"], r["ticket_id"], r["customer_id"], r["customer_name"],
-                r["event_type"], r["latency_ms"], r["event_time"], r["_ingested_at"],
-            )
-            for r in batch
-        ],
-    )
+    """Ghi một batch bằng transaction và upsert idempotent theo event_id."""
+    payload = json.dumps(batch)
+    con.execute("begin transaction")
+    try:
+        con.execute(
+            f"""
+                insert into {TABLE} (
+                    event_id, ticket_id, customer_id, customer_name,
+                    event_type, latency_ms, event_time, _ingested_at
+                )
+                select * from (
+                    select unnest(
+                        from_json(
+                            ?::json,
+                            '[{{"event_id":"VARCHAR","ticket_id":"VARCHAR",'
+                            '"customer_id":"VARCHAR","customer_name":"VARCHAR",'
+                            '"event_type":"VARCHAR","latency_ms":"INTEGER",'
+                            '"event_time":"TIMESTAMP","_ingested_at":"TIMESTAMP"}}]'
+                        ),
+                        recursive := true
+                    )
+                )
+                on conflict (event_id) do update set
+                    ticket_id     = excluded.ticket_id,
+                    customer_id   = excluded.customer_id,
+                    customer_name = excluded.customer_name,
+                    event_type    = excluded.event_type,
+                    latency_ms    = excluded.latency_ms,
+                    event_time    = excluded.event_time,
+                    _ingested_at  = excluded._ingested_at
+            """,
+            [payload],
+        )
+        con.execute("commit")
+    except Exception:
+        con.execute("rollback")
+        raise
 
 
 def maybe_crash(batch_no: int, crash_at: int | None) -> None:
@@ -112,9 +135,9 @@ def consume(
             # ── KHỐI CẦN XEM XÉT — nhiệm vụ 5, hạng mục (a) ───────────────
             # Ba dòng dưới đây được phép sắp xếp lại. maybe_crash() mô phỏng
             # `kill -9`: tiến trình chết ngay tại vị trí của nó, không rollback.
-            consumer.commit()                 # ghi nhận offset
-            maybe_crash(batch_no, crash_at)   # sự cố xảy ra tại đây
-            write_batch(con, batch)           # ghi dữ liệu
+            write_batch(con, batch)           # ghi bền vững trước
+            maybe_crash(batch_no, crash_at)   # crash -> batch sẽ được replay
+            consumer.commit()                 # chỉ commit offset sau khi ghi
             # ─────────────────────────────────────────────────────────────
 
             written += len(batch)
